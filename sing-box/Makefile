@@ -36,8 +36,6 @@ define Package/$(PKG_NAME)
   URL:=https://sing-box.sagernet.org
   DEPENDS:=$(GO_ARCH_DEPENDS) \
     +ca-bundle \
-    +kmod-inet-diag \
-    +kmod-netlink-diag \
     +kmod-tun
 endef
 
