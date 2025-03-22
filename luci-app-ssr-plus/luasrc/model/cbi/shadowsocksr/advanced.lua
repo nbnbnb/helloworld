@@ -66,6 +66,7 @@ o:value("https://fastly.jsdelivr.net/gh/gaoyifan/china-operator-ip@ip-lists/chin
 o.default = "https://ispip.clang.cn/all_cn.txt"
 
 o = s:option(Flag, "netflix_enable", translate("Enable Netflix Mode"))
+o.description = translate("When disabled shunt mode, will same time stopped shunt service.")
 o.rmempty = false
 
 o = s:option(Value, "nfip_url", translate("nfip_url"))
@@ -169,15 +170,15 @@ o.rmempty = false
 o.cfgvalue = function(self, section)
     local enabled = m:get(section, "enabled")
     if enabled == "0" then
-        return m:get(section, "old_server") or "same"
+        return m:get(section, "old_server")
     end
-    return Value.cfgvalue(self, section) or "same" -- Default to `same` when enabled
+    return Value.cfgvalue(self, section) -- Default to `same` when enabled
 end
 
 o.write = function(self, section, value)
     local enabled = m:get(section, "enabled")
     if enabled == "0" then
-        local old_server = Value.cfgvalue(self, section) or "same"
+        local old_server = Value.cfgvalue(self, section)
         if old_server ~= "nil" then
             m:set(section, "old_server", old_server)
         end
