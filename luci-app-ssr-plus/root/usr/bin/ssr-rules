@@ -7,20 +7,29 @@
 # See /LICENSE for more information.
 #
 
+. $IPKG_INSTROOT/etc/init.d/shadowsocksr
+
 # Detect firewall version and set appropriate tools
 detect_firewall() {
-	if command -v nft >/dev/null 2>&1 && \
-		{ [ -n "$(uci get firewall.@defaults[0].syn_flood 2>/dev/null)" ] || \
-		  [ -n "$(uci get firewall.@defaults[0].synflood_protect 2>/dev/null)" ]; } && \
-		! grep -q "fw3" /etc/init.d/firewall 2>/dev/null; then
+	check_run_environment
+	case "$USE_TABLES" in
+		nftables)
 			USE_NFT=1  
 			NFT="nft"
-			FWI=$(uci get firewall.shadowsocksr.path 2>/dev/null)  # firewall include file
-	else
-		USE_NFT=0
-		IPT="iptables -t nat"                                 # alias of iptables
-		FWI=$(uci get firewall.shadowsocksr.path 2>/dev/null) # firewall include file
-	fi
+			echolog "ssr-rules: Using nftables"
+			;;
+		iptables)
+			USE_NFT=0
+			IPT="iptables -t nat"        # alias of iptables TCP
+			ipt="iptables -t mangle"     # alias of iptables UDP
+			echolog "ssr-rules: Using iptables"
+			;;
+		*)
+			echolog "ERROR: No supported firewall backend"
+			return 1
+			;;
+	esac
+	FWI=$(uci get firewall.shadowsocksr.path 2>/dev/null)  # firewall include file
 }
 
 # Initialize firewall detection
@@ -190,6 +199,16 @@ cleanup_persistence_files() {
 		loger 5 "Removed run mode file: /tmp/.last_lan_gm_ip"
 	fi
 
+	# Remove xhttp file state and hash files
+	if [ -f "/tmp/.last_xhttp_file" ]; then
+		rm -f "/tmp/.last_xhttp_file" 2>/dev/null
+		loger 5 "Removed xhttp file state: /tmp/.last_xhttp_file"
+	fi
+	if [ -f "/tmp/.last_xhttp_hash" ]; then
+		rm -f "/tmp/.last_xhttp_hash" 2>/dev/null
+		loger 5 "Removed xhttp hash file: /tmp/.last_xhttp_hash"
+	fi
+
 	loger 5 "Persistence cleanup completed"
 	return 0
 }
@@ -280,16 +299,10 @@ flush_iptables_legacy() {
 	flush_iptables mangle
 	ip rule del fwmark 0x01/0x01 table 100 2>/dev/null
 	ip route del local 0.0.0.0/0 dev lo table 100 2>/dev/null
-	ipset -X ss_spec_lan_ac 2>/dev/null
-	ipset -X ss_spec_wan_ac 2>/dev/null
-	ipset -X ssr_gen_router 2>/dev/null
-	ipset -X fplan 2>/dev/null
-	ipset -X bplan 2>/dev/null
-	ipset -X gmlan 2>/dev/null
-	ipset -X oversea 2>/dev/null
-	ipset -X whitelist 2>/dev/null
-	ipset -X blacklist 2>/dev/null
-	ipset -X netflix 2>/dev/null
+	for setname in ss_spec_lan_ac ss_spec_lan_ac_udp ss_spec_wan_ac ss_spec_wan_ac_tcp ss_spec_wan_ac_udp ssr_gen_router \
+			china fplan bplan gmlan oversea whitelist blacklist netflix; do
+		ipset -X $setname 2>/dev/null
+	done
 	[ -n "$FWI" ] && echo '#!/bin/sh' >$FWI
 	return 0
 }
@@ -321,6 +334,11 @@ ipset_nft() {
 	# Bulk import china ip list safely (avoid huge single element limitation)
 	if [ -f "${china_ip:=/etc/ssrplus/china_ssr.txt}" ]; then
 		$NFT add element inet ss_spec china "{ $(tr '\n' ',' < "${china_ip}" | sed 's/,$//') }" 2>/dev/null
+	fi
+
+	# Bulk import xhttp ip list into nft whitelist (server + shunt)
+	if [ -f "${xhttp_ip:=/etc/ssrplus/xhttp_address.txt}" ]; then
+		$NFT add element inet ss_spec whitelist "{ $(tr '\n' ',' < "${xhttp_ip}" | sed 's/,$//') }" 2>/dev/null
 	fi
 
 	# Add IP addresses to sets
@@ -454,65 +472,115 @@ ipset_nft() {
 
 ipset_iptables() {
 	[ -f "$IGNORE_LIST" ] && /usr/share/shadowsocksr/chinaipset.sh "$IGNORE_LIST"
-	$IPT -N SS_SPEC_WAN_AC 2>/dev/null
-	$IPT -I SS_SPEC_WAN_AC -p tcp --dport 53 -d 127.0.0.0/8 -j RETURN
-	$IPT -I SS_SPEC_WAN_AC -p tcp ! --dport 53 -d "$server" -j RETURN
+
+	$IPT -N SS_SPEC_WAN_AC_TCP 2>/dev/null
+	$ipt -N SS_SPEC_WAN_AC_UDP 2>/dev/null
+
+	$IPT -F SS_SPEC_WAN_AC_TCP
+	$ipt -F SS_SPEC_WAN_AC_UDP
+
+	$IPT -I SS_SPEC_WAN_AC_TCP -p tcp --dport 53 -d 127.0.0.0/8 -j RETURN
+	$IPT -I SS_SPEC_WAN_AC_TCP -p tcp ! --dport 53 -d "$server" -j RETURN
+
+	$ipt -I SS_SPEC_WAN_AC_UDP -p udp --dport 53 -d 127.0.0.0/8 -j RETURN
+	$ipt -I SS_SPEC_WAN_AC_UDP -p udp ! --dport 53 -d "$server" -j RETURN
+
 	ipset -N gmlan hash:net 2>/dev/null
 	for ip in $LAN_GM_IP; do ipset -! add gmlan "$ip"; done
+
 	case "$RUNMODE" in
 	router)
 		ipset -! -R <<-EOF || return 1
-			create ss_spec_wan_ac hash:net
-			$(gen_spec_iplist | sed -e "s/^/add ss_spec_wan_ac /")
+			create ss_spec_wan_ac_tcp hash:net
+			$(gen_spec_iplist | sed -e "s/^/add ss_spec_wan_ac_tcp /")
 		EOF
-		$IPT -A SS_SPEC_WAN_AC -m set --match-set ss_spec_wan_ac dst -j RETURN
-		$IPT -A SS_SPEC_WAN_AC -m set --match-set china dst -j RETURN
-		$IPT -A SS_SPEC_WAN_AC -m set --match-set gmlan src -m set ! --match-set china dst -j SS_SPEC_WAN_FW
-		$IPT -A SS_SPEC_WAN_AC -j SS_SPEC_WAN_FW
+		ipset -! -R <<-EOF || return 1
+			create ss_spec_wan_ac_udp hash:net
+			$(gen_spec_iplist | sed -e "s/^/add ss_spec_wan_ac_udp /")
+		EOF
+		$IPT -A SS_SPEC_WAN_AC_TCP -m set --match-set ss_spec_wan_ac_tcp dst -j RETURN
+		$IPT -A SS_SPEC_WAN_AC_TCP -m set --match-set china dst -j RETURN
+		$IPT -A SS_SPEC_WAN_AC_TCP -m set --match-set gmlan src -m set ! --match-set china dst -j SS_SPEC_WAN_FW_TCP
+		$IPT -A SS_SPEC_WAN_AC_TCP -j SS_SPEC_WAN_FW_TCP
+
+		$ipt -A SS_SPEC_WAN_AC_UDP -m set --match-set ss_spec_wan_ac_udp dst -j RETURN
+		$ipt -A SS_SPEC_WAN_AC_UDP -m set --match-set china dst -j RETURN
+		$ipt -A SS_SPEC_WAN_AC_UDP -m set --match-set gmlan src -m set ! --match-set china dst -j SS_SPEC_WAN_FW_UDP
+		$ipt -A SS_SPEC_WAN_AC_UDP -j SS_SPEC_WAN_FW_UDP
 		;;
 	gfw)
 		ipset -N gfwlist hash:net 2>/dev/null
-		$IPT -A SS_SPEC_WAN_AC -m set --match-set china dst -j RETURN
-		$IPT -A SS_SPEC_WAN_AC -m set --match-set gfwlist dst -j SS_SPEC_WAN_FW
-		$IPT -A SS_SPEC_WAN_AC -m set --match-set gmlan src -m set ! --match-set china dst -j SS_SPEC_WAN_FW
+		$IPT -A SS_SPEC_WAN_AC_TCP -m set --match-set china dst -j RETURN
+		$IPT -A SS_SPEC_WAN_AC_TCP -m set --match-set gfwlist dst -j SS_SPEC_WAN_FW_TCP
+		$IPT -A SS_SPEC_WAN_AC_TCP -m set --match-set gmlan src -m set ! --match-set china dst -j SS_SPEC_WAN_FW_TCP
+
+		$ipt -A SS_SPEC_WAN_AC_UDP -m set --match-set china dst -j RETURN
+		$ipt -A SS_SPEC_WAN_AC_UDP -m set --match-set gfwlist dst -j SS_SPEC_WAN_FW_UDP
+		$ipt -A SS_SPEC_WAN_AC_UDP -m set --match-set gmlan src -m set ! --match-set china dst -j SS_SPEC_WAN_FW_UDP
 		;;
 	oversea)
 		ipset -N oversea hash:net 2>/dev/null
-		$IPT -I SS_SPEC_WAN_AC -m set --match-set oversea dst -j SS_SPEC_WAN_FW
-		$IPT -A SS_SPEC_WAN_AC -m set --match-set gmlan src -j SS_SPEC_WAN_FW
-		$IPT -A SS_SPEC_WAN_AC -m set --match-set china dst -j SS_SPEC_WAN_FW
+		$IPT -I SS_SPEC_WAN_AC_TCP -m set --match-set oversea dst -j SS_SPEC_WAN_FW_TCP
+		$IPT -A SS_SPEC_WAN_AC_TCP -m set --match-set gmlan src -j SS_SPEC_WAN_FW_TCP
+		$IPT -A SS_SPEC_WAN_AC_TCP -m set --match-set china dst -j SS_SPEC_WAN_FW_TCP
+
+		$ipt -I SS_SPEC_WAN_AC_UDP -m set --match-set oversea dst -j SS_SPEC_WAN_FW_UDP
+		$ipt -A SS_SPEC_WAN_AC_UDP -m set --match-set gmlan src -j SS_SPEC_WAN_FW_UDP
+		$ipt -A SS_SPEC_WAN_AC_UDP -m set --match-set china dst -j SS_SPEC_WAN_FW_UDP
 		;;
 	all)
-		$IPT -A SS_SPEC_WAN_AC -j SS_SPEC_WAN_FW
+		$IPT -A SS_SPEC_WAN_AC_TCP -j SS_SPEC_WAN_FW_TCP
+		$ipt -A SS_SPEC_WAN_AC_UDP -j SS_SPEC_WAN_FW_UDP
 		;;
 	esac
+
 	ipset -N fplan hash:net 2>/dev/null
 	for ip in $LAN_FP_IP; do ipset -! add fplan "$ip"; done
-		$IPT -I SS_SPEC_WAN_AC -m set --match-set fplan src -j SS_SPEC_WAN_FW
+	$IPT -I SS_SPEC_WAN_AC_TCP -m set --match-set fplan src -j SS_SPEC_WAN_FW_TCP
+	$ipt -I SS_SPEC_WAN_AC_UDP -m set --match-set fplan src -j SS_SPEC_WAN_FW_UDP
+
 	ipset -N bplan hash:net 2>/dev/null
 	for ip in $LAN_BP_IP; do ipset -! add bplan "$ip"; done
-		$IPT -I SS_SPEC_WAN_AC -m set --match-set bplan src -j RETURN
+	$IPT -I SS_SPEC_WAN_AC_TCP -m set --match-set bplan src -j RETURN
+	$ipt -I SS_SPEC_WAN_AC_UDP -m set --match-set bplan src -j RETURN
+
 	ipset -N whitelist hash:net 2>/dev/null
-	ipset -N blacklist hash:net 2>/dev/null
-	$IPT -I SS_SPEC_WAN_AC -m set --match-set blacklist dst -j SS_SPEC_WAN_FW
-	$IPT -I SS_SPEC_WAN_AC -m set --match-set whitelist dst -j RETURN
-	if [ $(ipset list music -name -quiet | grep music) ]; then
-		$IPT -I SS_SPEC_WAN_AC -m set --match-set music dst -j RETURN 2>/dev/null
+	if [ -f "${xhttp_ip:=/etc/ssrplus/xhttp_address.txt}" ]; then
+		while IFS= read -r ip; do
+			[ -n "$ip" ] && ipset add whitelist "$ip" -exist
+		done < "$xhttp_ip"
 	fi
+
+	ipset -N blacklist hash:net 2>/dev/null
+	$IPT -I SS_SPEC_WAN_AC_TCP -m set --match-set blacklist dst -j SS_SPEC_WAN_FW_TCP
+	$IPT -I SS_SPEC_WAN_AC_TCP -m set --match-set whitelist dst -j RETURN
+
+	$ipt -I SS_SPEC_WAN_AC_UDP -m set --match-set blacklist dst -j SS_SPEC_WAN_FW_UDP
+	$ipt -I SS_SPEC_WAN_AC_UDP -m set --match-set whitelist dst -j RETURN
+
+	if [ $(ipset list music -name -quiet | grep music) ]; then
+		$IPT -I SS_SPEC_WAN_AC_TCP -m set --match-set music dst -j RETURN 2>/dev/null
+		$ipt -I SS_SPEC_WAN_AC_UDP -m set --match-set music dst -j RETURN 2>/dev/null
+	fi
+
 	for ip in $WAN_BP_IP; do ipset -! add whitelist "$ip"; done
 	for ip in $WAN_FW_IP; do ipset -! add blacklist "$ip"; done
+
 	if [ "$SHUNT_PORT" != "0" ]; then
 		ipset -N netflix hash:net 2>/dev/null
 		for ip in $(cat "${SHUNT_LIST:=/dev/null}" 2>/dev/null); do ipset -! add netflix "$ip"; done
 		case "$SHUNT_PORT" in
 		0) ;;
 		1)
-			$IPT -I SS_SPEC_WAN_AC -p tcp -m set --match-set netflix dst -j REDIRECT --to-ports "$local_port"
+			$IPT -I SS_SPEC_WAN_AC_TCP -p tcp -m set --match-set netflix dst -j REDIRECT --to-ports "$local_port"
+			$ipt -I SS_SPEC_WAN_AC_UDP -p udp -m set --match-set netflix dst -j TPROXY --on-port "$local_port" --tproxy-mark 0x01/0x01
 			;;
 		*)
-			$IPT -I SS_SPEC_WAN_AC -p tcp -m set --match-set netflix dst -j REDIRECT --to-ports "$SHUNT_PORT"
+			$IPT -I SS_SPEC_WAN_AC_TCP -p tcp -m set --match-set netflix dst -j REDIRECT --to-ports "$SHUNT_PORT"
+			$ipt -I SS_SPEC_WAN_AC_UDP -p udp -m set --match-set netflix dst -j TPROXY --on-port "$SHUNT_PORT" --tproxy-mark 0x01/0x01
 			if [ "$SHUNT_PROXY" = "1" ]; then
-				$IPT -I SS_SPEC_WAN_AC -p tcp -d "$SHUNT_IP" -j REDIRECT --to-ports "$local_port"
+				$IPT -I SS_SPEC_WAN_AC_TCP -p tcp -d "$SHUNT_IP" -j REDIRECT --to-ports "$local_port"
+				$ipt -I SS_SPEC_WAN_AC_UDP -p udp -d "$SHUNT_IP" -j TPROXY --on-port "$local_port" --tproxy-mark 0x01/0x01
 			else
 				ipset -! add whitelist "$SHUNT_IP"
 			fi
@@ -598,19 +666,48 @@ fw_rule_nft() {
 }
 
 fw_rule_iptables() {
-	$IPT -N SS_SPEC_WAN_FW
-	$IPT -A SS_SPEC_WAN_FW -d 0.0.0.0/8 -j RETURN
-	$IPT -A SS_SPEC_WAN_FW -d 10.0.0.0/8 -j RETURN
-	$IPT -A SS_SPEC_WAN_FW -d 127.0.0.0/8 -j RETURN
-	$IPT -A SS_SPEC_WAN_FW -d 169.254.0.0/16 -j RETURN
-	$IPT -A SS_SPEC_WAN_FW -d 172.16.0.0/12 -j RETURN
-	$IPT -A SS_SPEC_WAN_FW -d 192.168.0.0/16 -j RETURN
-	$IPT -A SS_SPEC_WAN_FW -d 224.0.0.0/4 -j RETURN
-	$IPT -A SS_SPEC_WAN_FW -d 240.0.0.0/4 -j RETURN
-	$IPT -A SS_SPEC_WAN_FW -p tcp $PROXY_PORTS -j REDIRECT --to-ports "$local_port" 2>/dev/null || {
-		loger 3 "Can't redirect, please check the iptables."
+	# set up routing table for tproxy
+	if ! ip rule show | grep -Eq "fwmark 0x0*1.*lookup 100"; then
+		ip rule add fwmark 0x01/0x01 table 100 2>/dev/null
+	fi
+
+	if ! ip route show table 100 | grep -q "^local.*dev lo"; then
+		ip route add local 0.0.0.0/0 dev lo table 100 2>/dev/null
+	fi
+
+	# 创建TCP链 (在nat表中)
+	$IPT -N SS_SPEC_WAN_FW_TCP 2>/dev/null
+	$IPT -F SS_SPEC_WAN_FW_TCP
+
+	for net in \
+		0.0.0.0/8 10.0.0.0/8 127.0.0.0/8 169.254.0.0/16 \
+		172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4
+	do
+		$IPT -A SS_SPEC_WAN_FW_TCP -d "$net" -j RETURN
+	done
+
+	$IPT -A SS_SPEC_WAN_FW_TCP -p tcp $PROXY_PORTS -j REDIRECT --to-ports "$local_port" 2>/dev/null || {
+		loger 3 "Can't redirect TCP, please check the iptables."
 		exit 1
 	}
+
+	# 创建UDP链 (在mangle表中)
+	$ipt -N SS_SPEC_WAN_FW_UDP 2>/dev/null
+	$ipt -F SS_SPEC_WAN_FW_UDP
+
+	for net in \
+		0.0.0.0/8 10.0.0.0/8 127.0.0.0/8 169.254.0.0/16 \
+		172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4
+	do
+		$ipt -A SS_SPEC_WAN_FW_UDP -p udp -d "$net" -j RETURN
+	done
+
+	# UDP TPROXY规则 (必须在mangle表中)
+	$ipt -A SS_SPEC_WAN_FW_UDP -p udp $PROXY_PORTS -j TPROXY --on-port "$local_port" --tproxy-mark 0x01/0x01 2>/dev/null || {
+		loger 3 "Can't set UDP TPROXY, please check the iptables."
+		exit 1
+	}
+
 	return $?
 }
 
@@ -780,23 +877,38 @@ ac_rule_nft() {
 		$NFT add rule inet ss_spec ss_spec_output_udp $UDP_EXT_ARGS meta mark set 0x01 comment "\"$TAG\"" 2>/dev/null
 		;;
 	2)
+		# Create ss_spec_output tcp chain
+		if ! $NFT list chain inet ss_spec ss_spec_output >/dev/null 2>&1; then
+			$NFT add chain inet ss_spec ss_spec_output '{ type nat hook output priority 0; policy accept; }'
+		fi
+		$NFT flush chain inet ss_spec ss_spec_output 2>/dev/null
+		
+		# Exclude special local addresses
+		if $NFT list chain inet ss_spec ss_spec_output >/dev/null 2>&1; then
+			for net in 0.0.0.0/8 10.0.0.0/8 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4; do
+				$NFT add rule inet ss_spec ss_spec_output ip daddr $net return 2>/dev/null
+			done
+		fi
+
 		# router mode output chain: create ssr_gen_router set & router chain
 		$NFT add set inet ss_spec ssr_gen_router '{ type ipv4_addr; flags interval; }' 2>/dev/null
 		for ip in $(gen_spec_iplist); do
 			[ -n "$ip" ] && $NFT add element inet ss_spec ssr_gen_router "{ $ip }" 2>/dev/null
 		done
 		$NFT add chain inet ss_spec ss_spec_router 2>/dev/null
+		$NFT flush chain inet ss_spec ss_spec_router 2>/dev/null
 		$NFT add rule inet ss_spec ss_spec_router ip daddr @ssr_gen_router return 2>/dev/null
 		$NFT add rule inet ss_spec ss_spec_router jump ss_spec_wan_fw_tcp 2>/dev/null
-		$NFT add rule inet ss_spec ss_spec_output $TCP_EXT_ARGS jump ss_spec_router comment "\"$TAG\"" 2>/dev/null
 		$NFT add rule inet ss_spec ss_spec_router jump ss_spec_wan_fw_udp 2>/dev/null
-		$NFT add rule inet ss_spec ss_spec_output $UDP_EXT_ARGS jump ss_spec_router comment "\"$TAG\"" 2>/dev/null
+		$NFT add rule inet ss_spec ss_spec_output $TCP_EXT_ARGS jump ss_spec_router comment "\"$TAG\"" 2>/dev/null
+		$NFT add rule inet ss_spec ss_spec_output $UDP_EXT_ARGS meta mark set 0x01 comment "\"$TAG\"" 2>/dev/null
 		;;
 	esac
 	return 0
 }
 
 ac_rule_iptables() {
+	local MATCH_SET=""
 	if [ -n "$LAN_AC_IP" ]; then
 		case "${LAN_AC_IP%${LAN_AC_IP#?}}" in
 		w | W)
@@ -816,28 +928,39 @@ ac_rule_iptables() {
 		$(for ip in ${LAN_AC_IP#?}; do echo "add ss_spec_lan_ac $ip"; done)
 	EOF
 	if [ -z "$Interface" ]; then
-		$IPT -I PREROUTING 1 -p tcp $EXT_ARGS $MATCH_SET -m comment --comment "$TAG" -j SS_SPEC_WAN_AC
+		$IPT -I PREROUTING 1 -p tcp $EXT_ARGS $MATCH_SET -m comment --comment "$TAG" -j SS_SPEC_WAN_AC_TCP
+		$ipt -I PREROUTING 1 -p udp $EXT_ARGS $MATCH_SET -m comment --comment "$TAG" -j SS_SPEC_WAN_AC_UDP
 	else
 		for name in $Interface; do
 			local IFNAME=$(uci -P /var/state get network."$name".ifname 2>/dev/null)
 			[ -z "$IFNAME" ] && IFNAME=$(uci -P /var/state get network."$name".device 2>/dev/null)
-			[ -n "$IFNAME" ] && $IPT -I PREROUTING 1 ${IFNAME:+-i $IFNAME} -p tcp $EXT_ARGS $MATCH_SET -m comment --comment "$TAG" -j SS_SPEC_WAN_AC
+			if [ -n "$IFNAME" ]; then
+				$IPT -I PREROUTING 1 ${IFNAME:+-i $IFNAME} -p tcp $EXT_ARGS $MATCH_SET -m comment --comment "$TAG" -j SS_SPEC_WAN_AC_TCP
+				$ipt -I PREROUTING 1 ${IFNAME:+-i $IFNAME} -p udp $EXT_ARGS $MATCH_SET -m comment --comment "$TAG" -j SS_SPEC_WAN_AC_UDP
+			fi
 		done
 	fi
 
 	case "$OUTPUT" in
 	1)
-		$IPT -I OUTPUT 1 -p tcp $EXT_ARGS -m comment --comment "$TAG" -j SS_SPEC_WAN_AC
+		$IPT -I OUTPUT 1 -p tcp $EXT_ARGS -m comment --comment "$TAG" -j SS_SPEC_WAN_AC_TCP
+		#$ipt -I OUTPUT 1 -p udp $EXT_ARGS -m comment --comment "$TAG" -j MARK --set-xmark 0x01/0x01
 		;;
 	2)
 		ipset -! -R <<-EOF || return 1
 			create ssr_gen_router hash:net
 			$(gen_spec_iplist | sed -e "s/^/add ssr_gen_router /")
 		EOF
-		$IPT -N SS_SPEC_ROUTER && \
-		$IPT -A SS_SPEC_ROUTER -m set --match-set ssr_gen_router dst -j RETURN && \
-		$IPT -A SS_SPEC_ROUTER -j SS_SPEC_WAN_FW
-		$IPT -I OUTPUT 1 -p tcp -m comment --comment "$TAG" -j SS_SPEC_ROUTER
+		$IPT -N SS_SPEC_ROUTER_TCP 2>/dev/null
+		$IPT -F SS_SPEC_ROUTER_TCP 2>/dev/null
+		$IPT -A SS_SPEC_ROUTER_TCP -m set --match-set ssr_gen_router dst -j RETURN && \
+		$IPT -A SS_SPEC_ROUTER_TCP -j SS_SPEC_WAN_FW_TCP
+		$IPT -I OUTPUT 1 -p tcp -m comment --comment "$TAG" -j SS_SPEC_ROUTER_TCP
+		$ipt -N SS_SPEC_ROUTER_UDP 2>/dev/null
+		$ipt -F SS_SPEC_ROUTER_UDP 2>/dev/null
+		$ipt -A SS_SPEC_ROUTER_UDP -m set --match-set ssr_gen_router dst -j RETURN && \
+		$ipt -A SS_SPEC_ROUTER_UDP -j SS_SPEC_WAN_FW_UDP
+		#$ipt -I OUTPUT 1 -p udp -m comment --comment "$TAG" -j SS_SPEC_ROUTER_UDP
 		;;
 	esac
 	return $?
@@ -917,6 +1040,11 @@ tp_rule_nft() {
 	# Bulk import china ip list safely (avoid huge single element limitation)
 	if [ -f "${china_ip:=/etc/ssrplus/china_ssr.txt}" ]; then
 		$NFT add element ip ss_spec_mangle china "{ $(tr '\n' ',' < "${china_ip}" | sed 's/,$//') }" 2>/dev/null
+	fi
+
+	# Bulk import xhttp ip list into nft whitelist (server + shunt)
+	if [ -f "${xhttp_ip:=/etc/ssrplus/xhttp_address.txt}" ]; then
+		$NFT add element ip ss_spec_mangle whitelist "{ $(tr '\n' ',' < "${xhttp_ip}" | sed 's/,$//') }" 2>/dev/null
 	fi
 
 	# use priority mangle for compatibility with other rules
@@ -1032,25 +1160,62 @@ tp_rule_nft() {
 }
 
 tp_rule_iptables() {
-	ip rule add fwmark 0x01/0x01 table 100
-	ip route add local 0.0.0.0/0 dev lo table 100
-	local ipt="iptables -t mangle"
-	$ipt -N SS_SPEC_TPROXY
+	# set up routing table for tproxy
+	if ! ip rule show | grep -Eq "fwmark 0x0*1.*lookup 100"; then
+		ip rule add fwmark 0x01/0x01 table 100 2>/dev/null
+	fi
+
+	if ! ip route show table 100 | grep -q "^local.*dev lo"; then
+		ip route add local 0.0.0.0/0 dev lo table 100 2>/dev/null
+	fi
+	$ipt -N SS_SPEC_TPROXY 2>/dev/null
+	$ipt -F SS_SPEC_TPROXY
+	$ipt -N PREROUTING_UDP 2>/dev/null
+	$ipt -F PREROUTING_UDP
+
 	$ipt -A SS_SPEC_TPROXY -p udp --dport 53 -j RETURN
-	$ipt -A SS_SPEC_TPROXY -p udp -d 0.0.0.0/8 -j RETURN
-	$ipt -A SS_SPEC_TPROXY -p udp -d 10.0.0.0/8 -j RETURN
-	$ipt -A SS_SPEC_TPROXY -p udp -d 127.0.0.0/8 -j RETURN
-	$ipt -A SS_SPEC_TPROXY -p udp -d 169.254.0.0/16 -j RETURN
-	$ipt -A SS_SPEC_TPROXY -p udp -d 172.16.0.0/12 -j RETURN
-	$ipt -A SS_SPEC_TPROXY -p udp -d 192.168.0.0/16 -j RETURN
-	$ipt -A SS_SPEC_TPROXY -p udp -d 224.0.0.0/4 -j RETURN
-	$ipt -A SS_SPEC_TPROXY -p udp -d 240.0.0.0/4 -j RETURN
+
+	local MATCH_SET_UDP=""
+	if [ -n "$LAN_AC_IP" ]; then
+		case "${LAN_AC_IP%${LAN_AC_IP#?}}" in
+		w | W)
+			MATCH_SET_UDP="-m set --match-set ss_spec_lan_ac_udp src"
+			;;
+		b | B)
+			MATCH_SET_UDP="-m set ! --match-set ss_spec_lan_ac_udp src"
+			;;
+		*)
+			loger 3 "Bad argument \`-a $LAN_AC_IP\`."
+			return 2
+			;;
+		esac
+	fi
+	ipset -! -R <<-EOF || return 1
+		create ss_spec_lan_ac_udp hash:net
+		$(for ip in ${LAN_AC_IP#?}; do echo "add ss_spec_lan_ac_udp $ip"; done)
+	EOF
+
+	for net in \
+		0.0.0.0/8 10.0.0.0/8 127.0.0.0/8 169.254.0.0/16 \
+		172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4
+	do
+		$ipt -A SS_SPEC_TPROXY -p udp -d "$net" -j RETURN
+	done
 	$ipt -A SS_SPEC_TPROXY -p udp ! --dport 53 -d "$SERVER" -j RETURN
 	[ "$server" != "$SERVER" ] && ipset -! add whitelist "$SERVER"
+	if [ -f "${xhttp_ip:=/etc/ssrplus/xhttp_address.txt}" ]; then
+		while IFS= read -r ip; do
+			[ -n "$ip" ] && ipset add whitelist "$ip" -exist
+		done < "$xhttp_ip"
+	fi
 	$ipt -A SS_SPEC_TPROXY -p udp -m set --match-set bplan src -j RETURN
 	$ipt -A SS_SPEC_TPROXY -p udp $PROXY_PORTS -m set --match-set fplan src -j TPROXY --on-port "$LOCAL_PORT" --tproxy-mark 0x01/0x01
 	case "$RUNMODE" in
 	router)
+		ipset -! -R <<-EOF || return 1
+			create ss_spec_wan_ac hash:net
+			$(gen_spec_iplist | sed -e "s/^/add ss_spec_wan_ac /")
+		EOF
 		$ipt -A SS_SPEC_TPROXY -p udp -m set --match-set ss_spec_wan_ac dst -j RETURN
 		$ipt -A SS_SPEC_TPROXY -p udp -m set --match-set china dst -j RETURN
 		$ipt -A SS_SPEC_TPROXY -p udp --dport 80 -j DROP
@@ -1073,12 +1238,12 @@ tp_rule_iptables() {
 		;;
 	esac
 	if [ -z "$Interface" ]; then
-		$ipt -I PREROUTING 1 -p udp $EXT_ARGS $MATCH_SET -m comment --comment "$TAG" -j SS_SPEC_TPROXY
+		$ipt -I PREROUTING_UDP 1 -p udp $EXT_ARGS $MATCH_SET_UDP -m comment --comment "$TAG" -j SS_SPEC_TPROXY
 	else
 		for name in $Interface; do
 			local IFNAME=$(uci -P /var/state get network."$name".ifname 2>/dev/null)
 			[ -z "$IFNAME" ] && IFNAME=$(uci -P /var/state get network."$name".device 2>/dev/null)
-			[ -n "$IFNAME" ] && $ipt -I PREROUTING 1 ${IFNAME:+-i $IFNAME} -p udp $EXT_ARGS $MATCH_SET -m comment --comment "$TAG" -j SS_SPEC_TPROXY
+			[ -n "$IFNAME" ] && $ipt -I PREROUTING_UDP 1 ${IFNAME:+-i $IFNAME} -p udp $EXT_ARGS $MATCH_SET_UDP -m comment --comment "$TAG" -j SS_SPEC_TPROXY
 		done
 	fi
 	return $?
@@ -1207,7 +1372,7 @@ compare_rules() {
 	# Generate temporary file for current rules
 	local temp_file=$(mktemp)
 	local rules_file=$(mktemp)
-	loger 7 "DEBUG: Temporary file path: $current_rules_file"
+	loger 7 "DEBUG: Temporary file path: $rules_file"
 
 	# Export current rules to temporary file
 	$NFT list ruleset | awk '
@@ -1723,6 +1888,31 @@ if [ -n "$server" ] && [ -n "$local_port" ]; then
 			LAST_LAN_GM_IP=""
 		fi
 
+		# Check for changes in the existence and content of the server XHTTP address file
+		XHTTP_FILE_STATE_FILE="/tmp/.last_xhttp_file"
+		XHTTP_FILE_HASH_FILE="/tmp/.last_xhttp_hash"
+
+		# Get the current server XHTTP file status
+		XHTTP_FILE_EXISTS=0
+		XHTTP_FILE_HASH=""
+		if [ -f "/etc/ssrplus/xhttp_address.txt" ]; then
+			XHTTP_FILE_EXISTS=1
+			XHTTP_FILE_HASH=$(md5sum /etc/ssrplus/xhttp_address.txt 2>/dev/null | awk '{print $1}')
+		fi
+
+		# Read the previous server XHTTP file status and hash
+		if [ -f "$XHTTP_FILE_STATE_FILE" ]; then
+			LAST_XHTTP_FILE_EXISTS=$(cat "$XHTTP_FILE_STATE_FILE")
+		else
+			LAST_XHTTP_FILE_EXISTS=""
+		fi
+
+		if [ -f "$XHTTP_FILE_HASH_FILE" ]; then
+			LAST_XHTTP_FILE_HASH=$(cat "$XHTTP_FILE_HASH_FILE")
+		else
+			LAST_XHTTP_FILE_HASH=""
+		fi
+
 		# STEP 1: Check if TPROXY has value (1 or 2)
 		if [ "$TPROXY" = "1" ] || [ "$TPROXY" = "2" ]; then
 			TPROXY_HAS_VALUE=1
@@ -1788,6 +1978,28 @@ if [ -n "$server" ] && [ -n "$local_port" ]; then
 			ANY_IP_LIST_CHANGED=1
 		fi
 
+		# Check for changes in the existence of the server XHTTP address file.
+		if [ "$XHTTP_FILE_EXISTS" != "$LAST_XHTTP_FILE_EXISTS" ]; then
+			loger 6 "xhttp address file existence changed: '$LAST_XHTTP_FILE_EXISTS' -> '$XHTTP_FILE_EXISTS'"
+			ANY_IP_LIST_CHANGED=1
+		fi
+
+		# Check for XHTTP file content changes (compare hashes only when the file exists in both checks)
+		if [ "$XHTTP_FILE_EXISTS" = "1" ] && [ "$LAST_XHTTP_FILE_EXISTS" = "1" ]; then
+			if [ "$XHTTP_FILE_HASH" != "$LAST_XHTTP_FILE_HASH" ]; then
+				loger 6 "xhttp address file content changed (hash: '$LAST_XHTTP_FILE_HASH' -> '$XHTTP_FILE_HASH')"
+				ANY_IP_LIST_CHANGED=1
+			else
+				loger 6 "xhttp address file content unchanged"
+			fi
+		elif [ "$XHTTP_FILE_EXISTS" = "0" ] && [ "$LAST_XHTTP_FILE_EXISTS" = "1" ]; then
+			loger 6 "xhttp address file deleted"
+			ANY_IP_LIST_CHANGED=1
+		elif [ "$XHTTP_FILE_EXISTS" = "1" ] && [ "$LAST_XHTTP_FILE_EXISTS" = "0" ]; then
+			loger 6 "xhttp address file created"
+			ANY_IP_LIST_CHANGED=1
+		fi
+
 		# STEP 3: Determine if forced rebuild is needed
 		FORCE_RECREATE=0
 		PERSISTENCE_EXISTS=0
@@ -1822,6 +2034,8 @@ if [ -n "$server" ] && [ -n "$local_port" ]; then
 		echo "$(normalize_ip_list "$WAN_FW_IP")" > "$WAN_FW_IP_STATE_FILE"
 		echo "$(normalize_ip_list "$LAN_FP_IP")" > "$LAN_FP_IP_STATE_FILE"
 		echo "$(normalize_ip_list "$LAN_GM_IP")" > "$LAN_GM_IP_STATE_FILE"
+		echo "$XHTTP_FILE_EXISTS" > "$XHTTP_FILE_STATE_FILE"
+		echo "$XHTTP_FILE_HASH" > "$XHTTP_FILE_HASH_FILE"
 
 		# STEP 5: Check if run mode changed
 		if runmode_change "$RUNMODE"; then
