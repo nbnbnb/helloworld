@@ -1179,15 +1179,8 @@ o:depends({type = "v2ray", v2ray_protocol = "wireguard"})
 o.default = 1350
 o.rmempty = true
 
-o = s:option(Value, "tti", translate("TTI"))
-o.datatype = "uinteger"
-o:depends("transport", "kcp")
-o.default = 50
-o.rmempty = true
-
 o = s:option(Value, "uplink_capacity", translate("Uplink Capacity(Default:Mbps)"))
 o.datatype = "uinteger"
-o:depends("transport", "kcp")
 o:depends("type", "hysteria2")
 o:depends({type = "v2ray", v2ray_protocol = "hysteria2"})
 o.placeholder = 5
@@ -1195,29 +1188,12 @@ o.rmempty = true
 
 o = s:option(Value, "downlink_capacity", translate("Downlink Capacity(Default:Mbps)"))
 o.datatype = "uinteger"
-o:depends("transport", "kcp")
 o:depends("type", "hysteria2")
 o:depends({type = "v2ray", v2ray_protocol = "hysteria2"})
 o.placeholder = 20
 o.rmempty = true
 
-o = s:option(Value, "read_buffer_size", translate("Read Buffer Size"))
-o.datatype = "uinteger"
-o:depends("transport", "kcp")
-o.default = 2
-o.rmempty = true
-
-o = s:option(Value, "write_buffer_size", translate("Write Buffer Size"))
-o.datatype = "uinteger"
-o:depends("transport", "kcp")
-o.default = 2
-o.rmempty = true
-
 o = s:option(Value, "seed", translate("Obfuscate password (optional)"))
-o:depends("transport", "kcp")
-o.rmempty = true
-
-o = s:option(Flag, "congestion", translate("Congestion"))
 o:depends("transport", "kcp")
 o.rmempty = true
 
@@ -1266,6 +1242,14 @@ o.rmempty = true
 
 -- [[ User-Agent部分 ]]--
 o = s:option(Value, "user_agent", translate("User-Agent"))
+o.default = ""
+o:value("", translate("Default"))
+o:value("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.131 Safari/537.36", translate("chrome"))
+o:value("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:90.0) Gecko/20100101 Firefox/90.0", translate("firefox"))
+o:value("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.1 Safari/605.1.15", translate("safari"))
+o:value("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36 Edg/91.0.864.70", translate("edge"))
+o:value("Go-http-client/1.1", translate("golang"))
+o:value("curl/7.68.0", translate("curl"))
 o:depends("tcp_guise", "http")
 o:depends("transport", "ws")
 o:depends("transport", "httpupgrade")
@@ -1665,6 +1649,65 @@ o:depends("type", "trojan")
 o:depends("type", "hysteria2")
 o:depends({type = "v2ray", v2ray_protocol = "vless", transport = "xhttp"})
 o:depends({type = "v2ray", v2ray_protocol = "hysteria2"})
+
+o = s:option(ListValue, "domain_resolver", translate("Domain DNS Resolve"))
+o.description = translate(
+	"<ul>" ..
+	"<li>" .. translate("If the node address is a domain name, this DNS will be used for resolution.") .. "</li>" .. 
+	"<li>" .. string.format('<font style=\'color:red;\'>%s</font>', translate("Note: For node-specific DNS only. Keep Auto to avoid extra overhead.")) .. "</li>" ..
+	"</ul>"
+)
+o:value("", translate("Auto"))
+o:value("tcp", translate("TCP"))
+o:value("udp", translate("UDP"))
+o:value("https", translate("DoH"))
+o:depends("type", "v2ray")
+
+o = s:option(Value, "domain_resolver_dns", translate("DNS"))
+o.datatype = "or(ipaddr,ipaddrport)"
+o:value("114.114.114.114")
+o:value("223.5.5.5:53")
+o.default = "114.114.114.114"
+o:depends("domain_resolver", "tcp")
+o:depends("domain_resolver", "udp") 
+
+o = s:option(Value, "domain_resolver_dns_https", translate("DNS"))
+o:value("https://120.53.53.53/dns-query", translate("DNSPod"))
+o:value("https://223.5.5.5/dns-query", translate("AliDNS"))
+o.default = "https://120.53.53.53/dns-query"
+o:depends("domain_resolver", "https")
+
+o = s:option(ListValue, "domain_strategy", translate("Domain Strategy"))
+o.description = translate(
+	"<ul>" ..
+	"<li>" .. translate("If is domain name, The requested domain name will be resolved to IP before connect.") .. "</li>" .. 
+	"<li>" .. string.format('<font style=\'color:red;\'>%s</font>', translate("Note: For node-specific DNS only. Keep Auto to avoid extra overhead.")) .. "</li>" ..
+	"</ul>"
+)
+o.default = ""
+o:value("", translate("Auto"))
+o:value("UseIPv4v6", translate("Prefer IPv4"))
+o:value("UseIPv6v4", translate("Prefer IPv6"))
+o:value("UseIPv4", translate("IPv4 Only"))
+o:value("UseIPv6", translate("IPv6 Only"))
+o:depends("type", "v2ray")
+
+local v2ray_protocols = s.fields["v2ray_protocol"]
+if #v2ray_protocols > 0 then
+	for i, v in ipairs(v2ray_protocols) do
+		if not v:find("^_") then
+			s.fields["server"]:depends({ ["v2ray_protocol"] = v })
+			s.fields["server_port"]:depends({ ["v2ray_protocol"] = v })
+			s.fields["domain_resolver"]:depends({ ["v2ray_protocol"] = v })
+			s.fields["domain_strategy"]:depends({ ["v2ray_protocol"] = v })
+
+			if v ~= "hysteria2" then
+				s.fields["fast_open"]:depends({ ["v2ray_protocol"] = v })
+				s.fields["mptcp"]:depends({ ["v2ray_protocol"] = v })
+			end
+		end
+	end
+end
 
 o = s:option(Flag, "switch_enable", translate("Enable Auto Switch"))
 o.rmempty = false
